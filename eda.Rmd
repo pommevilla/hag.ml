@@ -1,0 +1,53 @@
+---
+title: "dnr_eda"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(ggplot2)
+library(readxl)
+library(stringr)
+library(janitor)
+```
+
+
+
+```{r}
+DNR <- read_xlsx("./data/IowaDNR_2019_Data_Merged.xlsx",
+                sheet = "WK6-15-2") %>% 
+  separate(Label, c("week", NA), "-") %>% 
+  clean_names()
+```
+
+```{r}
+DNR %>% view()
+```
+
+```{r}
+DNR %>% 
+  ggplot(aes(week, microcystin)) +
+  geom_point() + 
+  geom_line(group = 1) + 
+  facet_wrap(~ environmental_location, ncol = 4)
+```
+
+## Autocorrelations
+
+```{r}
+DNR %>% 
+  filter(environmental_location == "Brushy Creek Beach") %>% 
+  select(microcystin) %>% 
+  acf()
+```
+
+
+```{r}
+DNR %>% 
+  split(.$environmental_location) %>% 
+  map(~acf(.$microcystin, main = unique(.$environmental_location)))
+```
+
+
