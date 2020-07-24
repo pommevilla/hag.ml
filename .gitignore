@@ -2,3 +2,5 @@
 .idea
 *.Rproj
 my_work/
+.Rhistory
+.ipynb_checkpoints

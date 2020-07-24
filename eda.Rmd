@@ -8,12 +8,15 @@ knitr::opts_chunk$set(echo = TRUE)
 
 library(tidyverse)
 library(ggplot2)
+library(lubridate)
 library(readxl)
 library(stringr)
 library(janitor)
+library(zoo)
 ```
 
 
+## Chemical readings EDA
 
 ```{r}
 DNR <- read_xlsx("./data/IowaDNR_2019_Data_Merged.xlsx",
@@ -50,4 +53,28 @@ DNR %>%
   map(~acf(.$microcystin, main = unique(.$environmental_location)))
 ```
 
+## Station readings EDA
 
+```{r}
+# station_readings <- read.csv("./data/station_data-precip-only.csv") %>% 
+station_readings <- read.csv("./data/station_data.csv") %>%
+  separate(DATE, c('year', 'month', 'day'), "-") %>% 
+  clean_names()
+```
+
+```{r}
+station_readings %>% view()
+```
+
+```{r}
+station_readings %>% 
+  filter(station == "USC00138688" & month == '06') %>% 
+  view()
+```
+
+```{r}
+station_readings %>% 
+  filter(station == "USC00138688" & month == '06') %>% 
+  select(station, name, year, month, day, prcp) %>% 
+  mutate(prcp_5dma = rollmean(prcp, k = 5, fill = NA, align = 'right'))
+```
