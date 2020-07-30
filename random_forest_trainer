@@ -1,0 +1,367 @@
+from boruta import BorutaPy
+import pandas as pd
+from itertools import compress
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+plt.style.use('dark_background')
+# import sklearn
+import sys
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn import preprocessing
+import tensorflow
+from datetime import datetime, timedelta
+
+# sklearn.show_versions()
+
+def separate_into_training_and_testing_sets(training_set, test_set, quarts):
+    from sklearn.model_selection import train_test_split
+    xs = training_set.drop(['price'], axis = 1)
+    ys = training_set['price']
+    bins = training_set.price.quantile(quarts).values
+    ys_binned = np.digitize(ys, bins)
+
+    x_training, x_val, y_training, y_val = train_test_split(xs, ys,
+                                                            stratify=ys_binned,
+                                                            test_size=0.10
+                                                           )
+
+    x_test = test_set.drop(['id'], axis = 1)
+
+    return x_training, y_training, x_val, y_val, x_test
+
+def add_boruta_feature(boruta, n):
+    '''
+    Manually adds the feature at index n to a boruta model
+    :param boruta: an SKLearn boruta model
+    :param feature: an int for the desired feature index
+    :return: the sklearn model with the feature at index n changed to true in boruta.support_
+    '''
+
+    boruta.support_[n] = True
+    return boruta
+
+def remove_boruta_feature(boruta, n):
+    '''
+    Manually removes the feature at index n to a boruta model
+    :param boruta: an SKLearn boruta model
+    :param feature: an int for the desired feature index
+    :return: the skearn model with the feature at index n changed to true
+    '''
+    boruta.support_[n] = False
+    boruta.support_weak_ = False
+    return boruta
+
+def separate_date_into_mdy(df, col='DATE', drop=False, dropna=False):
+    '''
+
+    Separates the date column of a data frame into month, day, and year
+
+    :param df: a pandas data frame
+    :param col: a string of the column name containing the dates
+    :param drop: a boolean of whether or not to drop col
+    :param dropna: a boolean for whether or not to drop rows containing nas in column col
+    :return: a pandas data frame containing the three new columns
+    '''
+
+    if dropna:
+        df.dropna(subset=[col], inplace=True)
+
+    df[col] = df[col].astype('datetime64')
+
+    df['Month'] = df[col].dt.month.astype("int64")
+    df['Year'] = df[col].dt.year
+    df['Day'] = df[col].dt.day
+
+    # df['Month'] = pd.DatetimeIndex(df[col]).month
+    # df['Year'] = pd.DatetimeIndex(df[col]).year
+    # df['Day'] = pd.DatetimeIndex(df[col]).day
+
+    if drop:
+        del df[col]
+
+    return df
+
+def generate_rolling_mean(df, col, window, rm_col_name, group_by_var, min_periods=1):
+    '''
+    Creates a new column in the data frame of the rolling mean of a column
+
+    :param df: a pandas data frame
+    :param col: a string of the column name to compute the rolling mean for
+    :param window: an int for how big the rolling mean window should be
+    :param rm_col_name: a string name for the new rolling mean column
+    :param group_by_var: a string name for the variable to group by before calculating the rolling mean
+    :param min_periods: an int for the minimum number of observations to calculate the rolling mean
+    :return: a pandas data frame containing a new column called rm_col_name
+    '''
+
+    df[rm_col_name] = df.groupby(group_by_var)[col].rolling(window, min_periods=min_periods).mean().reset_index(0, drop=True)
+    return df
+
+def shift_columns(df, col, n, groupvar):
+    '''
+
+    :param df: a pandas data frame
+    :param col: a string of the column name to shift
+    :param n: the number of rows to shift by
+    :param groupvar: the variable to group by before shifting rows
+    :return: a pandas data frame with an additional column of the shifted values of col
+    '''
+
+    new_col_name = '{}_{}_ahead'.format(col, n)
+    # df[new_col_name] = df[col].shift(-n)
+    df[new_col_name] = df.groupby([groupvar])[col].shift(-n)
+
+    return df
+
+def read_station_lake_dictionary(file_name):
+    '''
+
+
+    :param file_name: the path to a tsv containing lakes and the station nearest to them
+    :return: a dictionary with keys the name of the lake and values the nearest station
+    '''
+
+    station_lake_map = {}
+
+    with open(file_name) as fin:
+        for line in fin:
+            line = line.rstrip().split('\t')
+            station_lake_map[line[0].rstrip()] = line[1].rstrip()
+
+    return station_lake_map
+
+
+station_data = pd.read_csv('./data/station_data.csv')
+station_data.dropna(subset=['DATE'], inplace=True)
+station_data['DATE'] = station_data['DATE'].astype('datetime64')
+station_data = station_data[['STATION', 'NAME', 'LATITUDE', 'LONGITUDE', 'DATE', 'PRCP',
+                             # 'AWND', 'EVAP', 'PRCP', 'TAVG', 'TMAX', 'TMIN', 'TOBS'
+                             ]].dropna()
+
+
+# for cat in ['PRCP', 'AWND', 'TAVG']:
+#     for i in [3, 5, 7]:
+#         new_col = '{}d_{}_rm'.format(i, cat)
+#         station_data = generate_rolling_mean(station_data, cat, i, new_col, 'STATION')
+
+lake_data = pd.read_excel('./data/IowaDNR_2019_Data_Merged.xlsx',
+                          sheet_name='WK6-15',
+                          usecols=[i for i in range(21)],
+                          encoding=sys.getfilesystemencoding()
+                          )
+
+lake_data.dropna(subset=['Collected Date'], inplace=True)
+lake_data['Category'] = lake_data['Category'].astype(np.int64)
+lake_data['pH'] = lake_data['pH'].astype(np.float64)
+lake_data['Environmental Location'] = lake_data['Environmental Location'].astype(str)
+
+lake_data.dropna(subset=['Collected Date'], inplace=True)
+lake_data['Collected Date'] = lake_data['Collected Date'].astype('datetime64')
+lake_data['Week'] = lake_data['Label'].str.split('-').str[0].astype(int)
+lake_data.drop(['Label', 'Client Reference'], axis=1, inplace=True)
+
+lake_data['TN'] = lake_data['TKN (mg N/L)'] + lake_data['NOx (mg N/L)']
+lake_data['TP'] = lake_data['TKP (mg P/L)'] + lake_data['ortho-P (mg P/L)']
+lake_data['TN:TP'] = lake_data['TN'] / lake_data['TP']
+lake_data['TN:TP Other'] = lake_data['TN'] / lake_data['TKP (mg P/L)']
+
+lake_data['McyA:16s'] = lake_data['mcyA.M'] / lake_data['16S']
+
+lake_data = lake_data.sort_values(by=['Week'])
+
+# for i in range(3):
+#     lake_data = shift_columns(lake_data, 'Microcystin', i + 1, 'Environmental Location')
+
+lake_data = shift_columns(lake_data, 'Microcystin', 1, 'Environmental Location')
+lake_data = shift_columns(lake_data, 'Category', 1, 'Environmental Location')
+
+lake_data.dtypes
+
+
+list(lake_data)
+
+
+
+microcystin_cats = ['Week'] + [col for col in lake_data if col.startswith('Microcystin')]
+lake_data.loc[:, microcystin_cats]
+
+## Combining the two dataframes
+
+### Getting a dictionary showing the station nearest each lake
+
+
+station_lake_map = read_station_lake_dictionary('./data/stations_nearest_lakes')
+
+
+lake_data['Nearest Station'] = lake_data['Environmental Location'].map(station_lake_map)
+
+
+combined = pd.merge(lake_data, station_data, how='left',
+                    left_on=['Nearest Station', 'Collected Date'],
+                    right_on=['STATION', 'DATE'])
+
+
+list(combined)
+
+print('{} dims: {}'.format('station_data', station_data.shape))
+print('{} dims: {}'.format('lake_data', lake_data.shape))
+print('{} dims: {}'.format('combined', combined.shape))
+
+
+cats_of_interest = microcystin_cats + \
+                   ['Collected Date', 'Environmental Location', 'Nearest Station'] + \
+                   [col for col in combined.columns if 'rm' in col]
+
+combined[cats_of_interest].\
+    loc[combined['Environmental Location'] == 'Nine Eagles Beach']
+
+
+corr_matrix = combined.corr()
+
+fig, ax = plt.subplots(figsize=(10,10))
+sns.heatmap(corr_matrix, xticklabels=corr_matrix.columns,
+            yticklabels=corr_matrix.columns,
+            annot=False,
+            cmap='coolwarm',
+            robust=True,
+            square=True,
+            ax=ax);
+
+drop_cats_for_classification = [
+                                'Collected Date', 'Environmental Location',
+                                'Category', 'Week', 'Nearest Station',
+                                'STATION', 'NAME', 'LATITUDE', 'LONGITUDE', 'DATE',
+                                'Microcystin_1_ahead',
+                                'Cylindrospermopsin',
+                                'DNA Conc',
+                                'Microcystin',
+                                # '5d_PRCP_rm', '7d_PRCP_rm',
+                                # '5d_AWND_rm', '7d_AWND_rm',
+                                # '3d_TAVG_rm', '5d_TAVG_rm', '7d_TAVG_rm',
+                                # 'TOBS', 'TAVG', 'TMAX', 'TMIN'
+                                ]
+target = 'Category_1_ahead'
+
+x_pre = combined.drop(columns=drop_cats_for_classification, axis=1).dropna()
+y = x_pre[target].values
+# x_pre = (x_pre - x_pre.mean()) / (x_pre.max() - x_pre.min() + 1)
+x = x_pre.drop(columns=[target], axis = 1).values
+
+from sklearn import preprocessing
+min_max_scaler = preprocessing.StandardScaler()
+x = min_max_scaler.fit_transform(x)
+
+y = y.ravel()
+
+
+print('Number of categories dropped: {}'.format(len(drop_cats_for_classification)))
+print(combined.shape)
+print(x.shape)
+print(y.shape)
+
+
+rf = RandomForestClassifier(n_jobs=-1,
+                           # class_weight='balanced',
+                           max_depth=5)
+
+feat_selector = BorutaPy(rf, n_estimators='auto',
+                         verbose=0,
+                         max_iter=100,
+                         random_state=489)
+
+
+feat_selector.fit(x, y)
+
+
+from itertools import compress
+
+## Adding TN:TP, PRCP manually
+add_boruta_feature(feat_selector, list(x_pre).index('TN:TP'))
+add_boruta_feature(feat_selector, -1)
+
+kept_categories = feat_selector.support_ | feat_selector.support_weak_
+boruta_selected_features = list(compress(list(x_pre.drop(columns=[target], axis=1)), kept_categories))
+
+print('kept_categories\t{}\nsupport\t{}\nweak_support\t{}'.format(
+    sum(kept_categories), sum(feat_selector.support_), sum(feat_selector.support_weak_)
+))
+
+print('The features selected as important by Boruta were: \n\t{}'.format(
+    '\n\t'.join(boruta_selected_features)
+))
+
+x_filtered = feat_selector.transform(x, weak=True)
+print('Number of paramaters before Boruta selection: {}'.format(x.shape[1]))
+print('Number of paramaters after Boruta selection: {}'.format(x_filtered.shape[1]))
+
+
+## Random Forest Training
+
+from sklearn.model_selection import train_test_split
+x_training, x_test, y_training, y_test = train_test_split(x_filtered, y,
+                                                          test_size=0.30,
+                                                          stratify=y)
+
+print('Dimensions:')
+print('X_filtered:\t{}\tX_training {}\tX_testing: {}'.format(x_filtered.shape, x_training.shape, x_test.shape))
+print('Y:\t\t{}\t\tY_training {}\tY_testing: {}'.format(y.shape, y_training.shape, y_test.shape))
+
+rf_classifier = RandomForestClassifier(random_state = 489,
+                                       max_depth=5,
+                                       n_jobs=-1,
+                                       class_weight='balanced',
+                                       n_estimators=1000)
+
+rf_classifier.fit(x_training, y_training)
+predictions = rf_classifier.predict(x_test)
+
+training_score = rf_classifier.score(x_training, y_training)
+oob_score = rf_classifier.oob_score
+test_score = rf_classifier.score(x_test, y_test)
+
+print('Random forest classifier performance:')
+print('\tTraining set: {}'.format(training_score))
+print('OOB score: {}'.format(oob_score))
+print('\tTest set: {}'.format(test_score))
+
+
+### Feature importances
+
+rf_feature_importances = rf_classifier.feature_importances_
+indices = np.argsort(rf_feature_importances)
+
+plt.title('Feature Importances: Random Forest Model')
+plt.barh(range(len(indices)), rf_feature_importances[indices], align='center')
+plt.yticks(range(len(indices)), [boruta_selected_features[i] for i in indices])
+plt.xlabel('Relative Importance')
+plt.show()
+
+## Compared to Random Forest without parameter pre-selection
+
+x_training_2, x_test_2, y_training_2, y_test_2 = train_test_split(x, y,
+                                                          test_size=0.30,
+                                                          stratify=y)
+rf_classifier_2 = RandomForestClassifier(random_state = 489,
+                                       max_depth=5,
+                                       n_jobs=-1,
+                                       class_weight='balanced',
+                                       n_estimators=1000)
+rf_classifier_2.fit(x_training_2, y_training_2)
+
+
+print('Dimensions:')
+print('X_filtered:\t{}\tX_training {}\tX_testing: {}'.format(x_filtered.shape, x_training.shape, x_test.shape))
+print('Y:\t\t{}\t\tY_training {}\tY_testing: {}'.format(y.shape, y_training.shape, y_test.shape))
+
+
+predictions_2 = rf_classifier_2.predict(x_test_2)
+training_score_2 = rf_classifier_2.score(x_training_2, y_training_2)
+oob_score_2 = rf_classifier_2.oob_score
+test_score_2 = rf_classifier_2.score(x_test_2, y_test_2)
+
+print('Random forest classifier performance:')
+print('\tTraining set: {}'.format(training_score_2))
+print('OOB score: {}'.format(oob_score_2))
+print('\tTest set: {}'.format(test_score_2))
+
