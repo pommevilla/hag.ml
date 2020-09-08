@@ -1,0 +1,780 @@
+---
+title: "Model Training"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(broom)
+library(ggplot2)
+library(janitor)
+library(readxl)
+library(tidymodels)
+library(tidyverse)
+library(conflicted)
+
+
+conflict_prefer("filter", "dplyr")
+conflict_prefer("select", "dplyr")
+
+theme_set(theme_light())
+
+```
+
+# Helpers
+
+```{r}
+get_roc_auc <- function(tbl, category) {
+  tbl %>% 
+  collect_predictions() %>% 
+  mutate(
+   .pred_class = names(.)[2:4][max.col(.[2:4])],
+   .pred_class = as.factor(stringi::stri_sub(.pred_class, -1, -1))
+  ) %>% 
+  mutate(.pred_class = factor(.pred_class, levels = c("1", "2", "3"))) %>% 
+  roc_auc(!!category, .pred_1:.pred_3)
+}
+
+plot_roc_auc <- function(tbl, category) {
+  tbl %>%   
+  collect_predictions() %>% 
+  mutate(
+   .pred_class = names(.)[2:4][max.col(.[2:4])],
+   .pred_class = as.factor(stringi::stri_sub(.pred_class, -1, -1))
+  ) %>% 
+  mutate(.pred_class = factor(.pred_class, levels = c("1", "2", "3"))) %>% 
+  roc_curve(!!category, .pred_1:.pred_3) %>%
+  # autoplot()
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = .level)) + 
+  geom_path() + 
+  labs(
+    color = "Risk category",
+    x = "1 - Specificity",
+    y = "Sensitivity"
+  )
+}
+
+```
+
+
+# Data prep
+
+```{r}
+DNR <- read_xlsx("./data/IowaDNR_2019_Data_Merged.xlsx",
+                sheet = "WK6-15-2") %>% 
+  separate(Label, c("week", NA), "-") %>% 
+  clean_names() %>%
+  filter(environmental_location != "Bob White Beach") %>% 
+  mutate(
+    tn = tkn_mg_n_l + n_ox_mg_n_l,
+    tp = tkp_mg_p_l + ortho_p_mg_p_l,
+    tn_tp = tn / tp,
+    tn_tp_2 = tn / tkp_mg_p_l,
+    mcya_16s = mcy_a_m / x16s,
+  ) %>% 
+  mutate(
+    category_a = as.factor(case_when(microcystin < 1 ~ 1, microcystin >= 1 & microcystin < 8 ~ 2, microcystin >= 8 ~ 3)),
+    category_b = as.factor(case_when(microcystin < 2 ~ 1, microcystin >= 2 & microcystin < 8 ~ 2, microcystin >= 8 ~ 3)),
+    category_c = as.factor(case_when(microcystin < 4 ~ 1, microcystin >= 4 & microcystin < 8 ~ 2, microcystin >= 8 ~ 3)),
+    category_d = as.factor(if_else(microcystin < 8, 1, 3))
+  ) %>% 
+  group_by(environmental_location) %>% 
+  # mutatet(vars(starts_with("category_")), lag) %>%
+  mutate(
+    category_a_ahead = lead(category_a, n = 1),
+    category_b_ahead = lead(category_b, n = 1),
+    category_c_ahead = lead(category_c, n = 1),
+    category_d_ahead = lead(category_d, 1)
+  ) %>% 
+  ungroup() %>% 
+  drop_na()
+
+```
+
+Create chart of class counts
+
+```{r}
+binary_counts <- DNR %>% count(category_d) %>% select(n)
+
+class_counts <- bind_cols(c(1, 2, 3),
+          DNR %>% count(category_a) %>% select(n),
+          DNR %>% count(category_b) %>% select(n),
+          DNR %>% count(category_c) %>% select(n),
+          data_frame(n = c(binary_counts$n[1], 0, binary_counts$n[2])) 
+          ) %>% 
+  set_names(c('category', 'a', 'b', 'c', 'd')) %>% 
+  pivot_longer(names_to = 'cutoff_scheme', values_to = "count", -category)
+
+
+class_counts %>% 
+  mutate(cutoff_scheme = case_when(
+    cutoff_scheme == 'a' ~ "Low",
+    cutoff_scheme == 'b' ~ "Mid",
+    cutoff_scheme == 'c' ~ "High",
+    cutoff_scheme == 'd' ~ "Binary"
+    )
+  ) %>%
+  mutate(cutoff_scheme = factor(cutoff_scheme, levels = c("Low", "Mid", "High", "Binary"))) %>% 
+  ggplot(aes(category, cutoff_scheme, fill = count)) + 
+  geom_tile(color = "white", size = 5) +
+  geom_text(aes(x = category, y = cutoff_scheme, label = count), color = 'white', size = 5) + 
+  scale_fill_viridis_b(option = "magma", direction = -1) + 
+  labs(fill = "Count", 
+       x = "Category", 
+       y = "Cutoff Scheme",
+       title = "Category Counts by microcystin classification scheme") + 
+  theme(panel.grid = element_blank(), 
+        panel.border = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        axis.ticks = element_blank()
+  )
+  
+```
+
+
+
+
+
+# Training models for each of the different cutoff parameters
+
+# Scheme A
+
+```{r}
+set.seed(489)
+
+tidy_split <- DNR %>%   
+  select(-starts_with(c("category_b", "category_c"))) %>% 
+  initial_split(prop = 0.8, strata = category_a_ahead)
+train_data <- training(tidy_split)
+test_data <- testing(tidy_split)
+
+tidy_k_folds <- vfold_cv(train_data, v = 5)
+```
+
+## Making the model
+
+```{r}
+rf_mod <- rand_forest(mtry = tune(),
+                      min_n = tune(), 
+                      trees = 1000) %>% 
+  set_engine("ranger", num.threads = parallel::detectCores() - 1, importance = "impurity") %>% 
+  set_mode("classification")
+```
+
+## Recipe
+
+```{r}
+rf_rec <- recipe(category_a_ahead ~ ., data = train_data) %>% 
+  step_rm(week, client_reference, collected_date, environmental_location, cylindrospermopsin, category_a, mcy_a_a) %>% 
+  step_normalize(all_numeric(), -all_outcomes()) 
+
+rf_workflow <- workflow() %>% 
+  add_model(rf_mod) %>% 
+  add_recipe(rf_rec)
+```
+
+## Tuning results
+
+```{r}
+set.seed(489)
+rf_res_a <- rf_workflow %>% 
+  tune_grid(resamples = tidy_k_folds,
+            grid = 25, 
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc, pr_auc, mn_log_loss))
+```
+
+```{r}
+# Select parameters with best roc_auc
+tune.a <- rf_res_a %>% 
+  select_best("roc_auc")
+
+
+# Apply parameters to model
+model.a <- finalize_model(rf_mod, tune.a)
+tidy_rec.a <- finalize_recipe(rf_rec, tune.a)
+
+# Finalize model workflow
+hab_pred_model.a <- workflow() %>% 
+  add_recipe(tidy_rec.a) %>% 
+  add_model(model.a)
+
+# Train model on training set and evaluate on test set
+model.a.fit <- last_fit(hab_pred_model.a, tidy_split)
+```
+
+```{r}
+model.a.fit %>% 
+  collect_predictions() %>% 
+  mutate(
+   .pred_class = names(.)[2:4][max.col(.[2:4])],
+   .pred_class = as.factor(stringi::stri_sub(.pred_class, -1, -1))
+  ) %>% 
+  conf_mat(truth = category_a_ahead, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap") + 
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  ) 
+
+# Training results
+rf_res_a %>% 
+  collect_predictions() %>% 
+  mutate(
+   .pred_class = names(.)[2:4][max.col(.[2:4])],
+   .pred_class = as.factor(stringi::stri_sub(.pred_class, -1, -1))
+  ) %>% 
+  conf_mat(truth = category_a_ahead, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap") + 
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  ) 
+
+# To do: make the graph nicer.
+rf_res_a %>% 
+  plot_roc_auc('category_a_ahead') + 
+  labs(
+    title = "ROC curve by risk category - Training",
+    subtitle = "Classification scheme: Low"
+  )
+
+# Training ROC-AUC
+rf_res_a %>% 
+  get_roc_auc()
+
+# Testing results
+model.a.fit %>% 
+  plot_roc_auc("category_a_ahead") + 
+  labs(
+    title = "ROC curve by risk category - Testing",
+    subtitle = "Classification scheme: Low"
+  )
+
+# Testing ROC-AUC
+model.a.fit %>% 
+  get_roc_auc()
+
+model.a.fit %>% 
+  collect_metrics()
+```
+
+
+# Scheme B
+
+
+```{r}
+set.seed(489)
+
+tidy_split <- DNR %>%   
+  select(-starts_with(c("category_a", "category_c"))) %>% 
+  initial_split(prop = 0.8, strata = category_b_ahead)
+train_data <- training(tidy_split)
+test_data <- testing(tidy_split)
+
+tidy_k_folds <- vfold_cv(train_data, v = 5)
+```
+
+## Making the model
+
+```{r}
+rf_mod <- rand_forest(mtry = tune(),
+                      min_n = tune(), 
+                      trees = 1000) %>% 
+  set_engine("ranger", num.threads = parallel::detectCores() - 1, importance = "impurity") %>% 
+  set_mode("classification")
+```
+
+## Recipe
+
+```{r}
+rf_rec <- recipe(category_b_ahead ~ ., data = train_data) %>% 
+  step_rm(week, client_reference, collected_date, environmental_location, cylindrospermopsin, category_b, mcy_a_a) %>% 
+  step_normalize(all_numeric(), -all_outcomes()) 
+
+rf_workflow <- workflow() %>% 
+  add_model(rf_mod) %>% 
+  add_recipe(rf_rec)
+```
+
+## Tuning results
+
+```{r}
+set.seed(489)
+rf_res_b <- rf_workflow %>% 
+  tune_grid(resamples = tidy_k_folds,
+            grid = 25, 
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc, pr_auc, mn_log_loss))
+```
+
+```{r}
+# Select parameters with best roc_auc
+tune.b <- rf_res_b %>% 
+  select_best("roc_auc")
+
+
+# Apply parameters to model
+model.b <- finalize_model(rf_mod, tune.b)
+tidy_rec.b <- finalize_recipe(rf_rec, tune.b)
+
+# Finalize model workflow
+hab_pred_model.b <- workflow() %>% 
+  add_recipe(tidy_rec.b) %>% 
+  add_model(model.b)
+
+# Train model on training set and evaluate on test set
+model.b.fit <- last_fit(hab_pred_model.b, tidy_split)
+```
+
+```{r}
+# Testing results
+model.b.fit %>% 
+  collect_predictions() %>% 
+  mutate(
+   .pred_class = names(.)[2:4][max.col(.[2:4])],
+   .pred_class = as.factor(stringi::stri_sub(.pred_class, -1, -1))
+  ) %>% 
+  mutate(.pred_class = factor(.pred_class, levels = c("1", "2", "3"))) %>% 
+  conf_mat(truth = category_b_ahead, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap") + 
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  ) 
+
+# Training results
+rf_res_b %>% 
+  collect_predictions() %>% 
+  mutate(
+   .pred_class = names(.)[2:4][max.col(.[2:4])],
+   .pred_class = as.factor(stringi::stri_sub(.pred_class, -1, -1))
+  ) %>% 
+  mutate(.pred_class = factor(.pred_class, levels = c("1", "2", "3"))) %>%
+  conf_mat(truth = category_b_ahead, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap") + 
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  ) 
+
+# To do: make the graph nicer.
+rf_res_b %>% 
+  plot_roc_auc('category_b_ahead') + 
+  labs(
+    title = "ROC curve by risk category - Training",
+    subtitle = "Classification scheme: Mid"
+  )
+
+# Training ROC-AUC
+rf_res_b %>% 
+  get_roc_auc("category_b_ahead")
+
+# Testing results
+model.b.fit %>% 
+  plot_roc_auc("category_b_ahead") + 
+  labs(
+    title = "ROC curve by risk category - Testing",
+    subtitle = "Classification scheme: Mid"
+  )
+
+# Testing ROC-AUC
+model.b.fit %>% 
+  get_roc_auc("category_b_ahead")
+
+model.b.fit %>% 
+  collect_metrics()
+```
+
+
+# Scheme C
+
+```{r}
+set.seed(489)
+
+tidy_split <- DNR %>%   
+  select(-starts_with(c("category_a", "category_b"))) %>% 
+  initial_split(prop = 0.8, strata = category_c_ahead)
+train_data <- training(tidy_split)
+test_data <- testing(tidy_split)
+
+tidy_k_folds <- vfold_cv(train_data, v = 5)
+```
+
+## Making the model
+
+```{r}
+rf_mod <- rand_forest(mtry = tune(),
+                      min_n = tune(), 
+                      trees = 1000) %>% 
+  set_engine("ranger", num.threads = parallel::detectCores() - 1, importance = "impurity") %>% 
+  set_mode("classification")
+```
+
+## Recipe
+
+```{r}
+rf_rec <- recipe(category_c_ahead ~ ., data = train_data) %>% 
+  step_rm(week, client_reference, collected_date, environmental_location, cylindrospermopsin, category_c, mcy_a_a) %>% 
+  step_normalize(all_numeric(), -all_outcomes()) 
+
+rf_workflow <- workflow() %>% 
+  add_model(rf_mod) %>% 
+  add_recipe(rf_rec)
+```
+
+## Tuning results
+
+```{r}
+set.seed(489)
+rf_res_c <- rf_workflow %>% 
+  tune_grid(resamples = tidy_k_folds,
+            grid = 25, 
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc, pr_auc, mn_log_loss))
+```
+
+```{r}
+# Select parameters with best roc_auc
+tune.c <- rf_res_c %>% 
+  select_best("roc_auc")
+
+
+# Apply parameters to model
+model.c <- finalize_model(rf_mod, tune.c)
+tidy_rec.c <- finalize_recipe(rf_rec, tune.c)
+
+# Finalize model workflow
+hab_pred_model.c <- workflow() %>% 
+  add_recipe(tidy_rec.c) %>% 
+  add_model(model.c)
+
+# Train model on training set and evaluate on test set
+model.c.fit <- last_fit(hab_pred_model.c, tidy_split)
+```
+
+```{r}
+# Testing results
+model.c.fit %>% 
+  collect_predictions() %>% 
+  mutate(
+   .pred_class = names(.)[2:4][max.col(.[2:4])],
+   .pred_class = as.factor(stringi::stri_sub(.pred_class, -1, -1))
+  ) %>% 
+  mutate(.pred_class = factor(.pred_class, levels = c("1", "2", "3"))) %>% 
+  conf_mat(truth = category_c_ahead, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap") + 
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  ) 
+
+# Training results
+rf_res_c %>% 
+  collect_predictions() %>% 
+  mutate(
+   .pred_class = names(.)[2:4][max.col(.[2:4])],
+   .pred_class = as.factor(stringi::stri_sub(.pred_class, -1, -1))
+  ) %>% 
+  mutate(.pred_class = factor(.pred_class, levels = c("1", "2", "3"))) %>%
+  conf_mat(truth = category_c_ahead, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap") + 
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  ) 
+
+# To do: make the graph nicer.
+rf_res_c %>% 
+  plot_roc_auc('category_c_ahead') + 
+  labs(
+    title = "ROC curve by risk category - Training",
+    subtitle = "Classification scheme: High"
+  )
+
+# Training ROC-AUC
+rf_res_c %>% 
+  get_roc_auc("category_c_ahead")
+
+# Testing results
+model.c.fit %>% 
+  plot_roc_auc("category_c_ahead") + 
+  labs(
+    title = "ROC curve by risk category - Testing",
+    subtitle = "Classification scheme: High"
+  )
+
+# Testing ROC-AUC
+model.c.fit %>% 
+  get_roc_auc("category_c_ahead")
+
+model.c.fit %>% 
+  collect_metrics()
+```
+
+
+# Binary Class
+
+```{r}
+
+
+DNR <- read_xlsx("./data/IowaDNR_2019_Data_Merged.xlsx",
+                sheet = "WK6-15-2") %>% 
+  separate(Label, c("week", NA), "-") %>% 
+  clean_names() %>%
+  filter(environmental_location != "Bob White Beach") %>% 
+  mutate(
+    tn = tkn_mg_n_l + n_ox_mg_n_l,
+    tp = tkp_mg_p_l + ortho_p_mg_p_l,
+    tn_tp = tn / tp,
+    tn_tp_2 = tn / tkp_mg_p_l,
+    mcya_16s = mcy_a_m / x16s,
+  ) %>% 
+  mutate(
+    category_a = as.factor(case_when(microcystin < 1 ~ 1, microcystin >= 1 & microcystin < 8 ~ 2, microcystin >= 8 ~ 3)),
+    category_b = as.factor(case_when(microcystin < 2 ~ 1, microcystin >= 2 & microcystin < 8 ~ 2, microcystin >= 8 ~ 3)),
+    category_c = as.factor(case_when(microcystin < 4 ~ 1, microcystin >= 4 & microcystin < 8 ~ 2, microcystin >= 8 ~ 3)),
+    category_d = as.factor(if_else(microcystin < 8, 1, 3))
+  ) %>% 
+  group_by(environmental_location) %>% 
+  # mutatet(vars(starts_with("category_")), lag) %>%
+  mutate(
+    category_a_ahead = lead(category_a, n = 1),
+    category_b_ahead = lead(category_b, n = 1),
+    category_c_ahead = lead(category_c, n = 1),
+    category_d_ahead = lead(category_d, 1)
+  ) %>% 
+  ungroup() %>% 
+  drop_na()
+```
+
+```{r}
+set.seed(489)
+
+tidy_split <- DNR %>%   
+  select(-starts_with(c("category_a", "category_b", "category_c"))) %>% 
+  initial_split(prop = 0.8, strata = category_d_ahead)
+train_data <- training(tidy_split)
+test_data <- testing(tidy_split)
+
+tidy_k_folds <- vfold_cv(train_data, v = 5)
+```
+
+## Making the model
+
+```{r}
+rf_mod <- rand_forest(mtry = tune(),
+                      min_n = tune(), 
+                      trees = 1000) %>% 
+  set_engine("ranger", num.threads = parallel::detectCores() - 1, importance = "impurity") %>% 
+  set_mode("classification")
+```
+
+## Recipe
+
+```{r}
+rf_rec <- recipe(category_d_ahead ~ ., data = train_data) %>% 
+  step_rm(week, client_reference, collected_date, environmental_location, cylindrospermopsin, category_d, mcy_a_a) %>% 
+  step_normalize(all_numeric(), -all_outcomes()) 
+
+rf_workflow <- workflow() %>% 
+  add_model(rf_mod) %>% 
+  add_recipe(rf_rec)
+```
+
+## Tuning results
+
+```{r}
+set.seed(489)
+rf_res_d <- rf_workflow %>% 
+  tune_grid(resamples = tidy_k_folds,
+            grid = 25, 
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc, pr_auc, mn_log_loss))
+```
+
+```{r}
+# Select parameters with best roc_auc
+tune.d <- rf_res_d %>% 
+  select_best("roc_auc")
+
+
+# Apply parameters to model
+model.d <- finalize_model(rf_mod, tune.d)
+tidy_rec.d <- finalize_recipe(rf_rec, tune.d)
+
+# Finalize model workflow
+hab_pred_model.d <- workflow() %>% 
+  add_recipe(tidy_rec.d) %>% 
+  add_model(model.d)
+
+# Train model on training set and evaluate on test set
+model.d.fit <- last_fit(hab_pred_model.d, tidy_split)
+```
+
+```{r}
+model.d.fit %>% 
+  collect_predictions() %>% 
+  mutate(
+   .pred_class = names(.)[2:3][max.col(.[2:3])],
+   .pred_class = as.factor(stringi::stri_sub(.pred_class, -1, -1))
+  ) %>% 
+  conf_mat(truth = category_d_ahead, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap") + 
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  ) 
+
+# Training results
+rf_res_d %>% 
+  collect_predictions() %>% 
+  mutate(
+   .pred_class = names(.)[2:3][max.col(.[2:3])],
+   .pred_class = as.factor(stringi::stri_sub(.pred_class, -1, -1))
+  ) %>% 
+  conf_mat(truth = category_d_ahead, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap") + 
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  ) 
+
+# To do: make the graph nicer.
+rf_res_d %>% 
+  collect_predictions() %>% 
+  mutate(
+   .pred_class = names(.)[2:3][max.col(.[2:3])],
+   .pred_class = as.factor(stringi::stri_sub(.pred_class, -1, -1))
+  ) %>% 
+  roc_curve(category_d_ahead, .pred_1) %>%
+  # autoplot()
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) + 
+  geom_path() + 
+  labs(
+    color = "Risk category",
+    x = "1 - Specificity",
+    y = "Sensitivity"
+  )
+  labs(
+    title = "ROC curve by risk category - Training",
+    subtitle = "Classification scheme: Binary"
+  )
+
+# Training ROC-AUC
+rf_res_a %>% 
+  get_roc_auc()
+
+# Testing results
+model.d.fit %>% 
+  collect_predictions() %>% 
+  mutate(
+   .pred_class = names(.)[2:3][max.col(.[2:3])],
+   .pred_class = as.factor(stringi::stri_sub(.pred_class, -1, -1))
+  ) %>% 
+  roc_curve(category_d_ahead, .pred_1) %>%
+  # autoplot()
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) + 
+  geom_path() + 
+  labs(
+    color = "Risk category",
+    x = "1 - Specificity",
+    y = "Sensitivity"
+  ) +
+  labs(
+    title = "ROC curve by risk category - Testing",
+    subtitle = "Classification scheme: Binary"
+  )
+
+
+# Testing ROC-AUC
+model.d.fit %>% 
+  collect_predictions() %>% 
+  mutate(
+   .pred_class = names(.)[2:3][max.col(.[2:3])],
+   .pred_class = as.factor(stringi::stri_sub(.pred_class, -1, -1))
+  ) %>% 
+  roc_auc(category_d_ahead, .pred_1)
+
+model.a.fit %>% 
+  collect_metrics()
+```
+
+
+# All Results
+
+```{r}
+bind_rows(
+  model.a.fit %>% collect_metrics() %>% select(-.estimator),
+  model.b.fit %>% collect_metrics() %>% select(-.estimator),
+  model.c.fit %>% collect_metrics() %>% select(-.estimator),
+  model.d.fit %>% collect_metrics() %>% select(-.estimator)
+) %>% 
+  mutate(scheme = rep(c("Low", "Mid", "High", "Binary"), each = 2),
+         scheme = factor(scheme, levels = c("Low", "Mid", "High", "Binary")),
+         .metric = if_else(.metric == "roc_auc", "ROC AUC", "Accuracy")) %>% 
+  select(scheme, everything()) %>% 
+  ggplot(aes(scheme, .metric)) + 
+  geom_tile(color = "black", fill = "white") +
+  geom_text(aes(label = .estimate %>% round(4)), color = 'black') + 
+  labs(x = "", 
+       y = "",
+       title = "Performance on test set by scheme and metric") + 
+  theme(panel.grid = element_blank(), 
+        panel.border = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        axis.ticks = element_blank()
+  )
+```
+
+
+```{r}
+fit_results <- bind_rows(
+  model.a.fit %>% collect_metrics() %>% select(-.estimator),
+  model.b.fit %>% collect_metrics() %>% select(-.estimator),
+  model.c.fit %>% collect_metrics() %>% select(-.estimator),
+  model.d.fit %>% collect_metrics() %>% select(-.estimator)
+) %>%
+  mutate(scheme = rep(c("Low", "Mid", "High", "Binary"), each = 2),
+         scheme = factor(scheme, levels = c("Low", "Mid", "High", "Binary")),
+         .metric = if_else(.metric == "roc_auc", "ROC AUC", "Accuracy"),
+         .metric = factor(.metric, levels = c("ROC AUC", "Accuracy"))) %>% 
+  select(scheme, everything()) 
+
+fit_results %>% 
+  ggplot(aes(.metric, .estimate, color = scheme)) +
+  geom_point(size = 2)  +
+  geom_line(aes(group = scheme), size = 1) + 
+  geom_text(aes(label = round(.estimate, 3),
+                hjust = ifelse(.metric == "ROC AUC", 1.2, -0.2))) + 
+  theme(
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    plot.title = element_text(hjust = 0.5),
+    panel.border = element_blank()
+  ) + 
+  labs(
+    x = "",
+    y = "",
+    title = "Model performance by scheme",
+    color = "Scheme"
+  ) + 
+  scale_x_discrete(expand = c(0.05, 0.05)) +
+  scale_y_continuous(limits = c(0.75, 1), expand = c(0, 0)) + 
+    coord_cartesian(clip = "off")
+
+
+
+```
+
+```{r}
+
+final_model <- fit(hab_pred_model.d, test_data)
+ranger_obj <- pull_workflow_fit(final_model)
+
+ranger_obj$variable.importance
+```
+
+

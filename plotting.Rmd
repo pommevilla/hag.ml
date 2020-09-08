@@ -1,0 +1,257 @@
+---
+title: "dnr_eda"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(readxl)
+library(maptools)
+library(sf)
+library(stringr)
+library(janitor)
+library(tmap)
+library(zoo)
+library(exactextractr)
+library(raster)
+library(rgdal)
+library(rasterVis)
+library(RColorBrewer)
+
+
+library(conflicted)
+
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+```
+
+
+## Chemical readings EDA
+
+```{r}
+
+iowa_crs <- 26976
+
+read.iowa_sf <- function(x) {
+  st_read(x) %>% 
+  st_transform(iowa_crs) %>% 
+  st_simplify(dTolerance = 500)
+}
+```
+
+
+```{r}
+DNR <- read_xlsx("./data/IowaDNR_2019_Data_Merged.xlsx",
+                sheet = "WK6-15-2") %>% 
+  separate(Label, c("week", NA), "-") %>% 
+  clean_names()
+
+nearest_stations <- read.delim('./data/stations_nearest_lakes') %>% 
+  clean_names()
+```
+
+## Station readings EDA
+
+```{r}
+station_readings <- read.csv("./data/station_data.csv") %>%
+  clean_names() %>% 
+  separate(date, c('year', 'month', 'day'), "-") %>% 
+  separate(name, c('name', NA), ",") %>% 
+  group_by(station) %>% 
+  slice_head(1) %>% 
+  filter(station %in% nearest_stations$station) %>% 
+  ungroup()
+
+station_lat_longs <- station_readings %>%
+  select(station, latitude, longitude)
+
+site_lat_long <- read.csv("./data/sampling_site_coordinates.csv") %>% 
+  clean_names() %>% 
+  st_as_sf(coords = c('site_longitude', 'site_latitude'), crs = 4326) %>% 
+  st_transform(crs = iowa_crs)
+
+site_buffers <- site_lat_long %>% 
+  st_buffer(1000)
+```
+
+```{r}
+joined_stations <- inner_join(station_lat_longs, nearest_stations) %>% 
+  select(station, site, latitude, longitude) %>% 
+  distinct(station, .keep_all = TRUE)%>% 
+  # unique() %>% 
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>% 
+  st_transform(crs = iowa_crs)
+rownames(nearest_stations) <- NULL
+
+```
+
+
+
+### Missing two stations:
+
+* Lake of Three Fires Beach: USC00130576
+* Lake Anita Beach: US1IACS0002
+
+## Land Use Maps
+
+```{r}
+# iowa.land_use <- raster('~/../repos/cyanotoxin_paper/gis_data/NLCD_Kssz1v5YqCn8DKpm0t3d/NLCD_2016_Land_Cover_L48_20190424_Kssz1v5YqCn8DKpm0t3d.tiff')
+
+iowa.land_use <- raster('~/../Documents/ArcGIS/Projects/cyanotoxins/NLCD_2016_Land_Cover_1.tif')
+land_use_categories <- read.csv('gis_data/NLCD_Kssz1v5YqCn8DKpm0t3d/NLCD_landcover_legend_2018_12_17_Kssz1v5YqCn8DKpm0t3d.csv',
+                                col.names = c('value', 'category')) %>% 
+  filter(category != "")
+
+
+if (!file.exists('water_shed_areas_8HU.rds')) {
+  freqs <-
+    exact_extract(iowa.land_use, watershed.hu_8, function(value, coverage_fraction) {
+      data.frame(value = value,
+                 frac = coverage_fraction / sum(coverage_fraction)) %>%
+        group_by(value) %>%
+        summarize(freq = sum(frac))
+    }) %>%
+    apply(2, function(x)
+      pivot_wider(data.frame(x),
+                  names_from = value,
+                  values_from = freq)) %>%
+    bind_rows() %>%
+    rename(!!!set_names(names(.), land_use_categories$category)) %>%
+    mutate(watershed = row_number()) %>%
+    replace(is.na(.), 0) %>%
+    clean_names()
+  
+  saveRDS(freqs, 'water_shed_areas_8HU.rds')
+}
+
+
+freqs <- readRDS('water_shed_areas_8HU.rds') %>%
+  dplyr::select(watershed, unclassified:emergent_herbaceuous_wetlands)
+
+site_classes <-  exact_extract(iowa.land_use, site_buffers, function(value, coverage_fraction) {
+      data.frame(value = value,
+                 frac = coverage_fraction / sum(coverage_fraction)) %>%
+        group_by(value) %>%
+        summarize(freq = sum(frac))
+    }) %>%
+    apply(2, function(x)
+      pivot_wider(data.frame(x),
+                  names_from = value,
+                  values_from = freq)) %>%
+    bind_rows() %>% 
+    set_names(land_use_categories$category[match(names(.), land_use_categories$value)]) %>%  
+    mutate(sample_site = row_number()) %>%
+    replace(is.na(.), 0) %>%
+    clean_names() %>% 
+    dplyr::select(sample_site, everything()) 
+
+bind_cols(site_classes, site_buffers) %>% view()
+
+cat_finder <- function(x) {
+  # x %>% 
+    # str_sub(2) %>% 
+  land_use_categories %>% 
+    filter(value == x) %>% 
+    dplyr::select(category)
+}
+```
+
+
+
+## Some plotting: watersheds
+
+```{r}
+watershed.hu_8 <- read.iowa_sf('~/../Documents/ArcGIS/Projects/cyanotoxins/WBD_HU_08_10_12/WBD_HU_08_IA.shp') %>% 
+  mutate(watershed = row_number())
+watershed.hu_10 <- read.iowa_sf('~/../Documents/ArcGIS/Projects/cyanotoxins/WBD_HU_08_10_12/WBD_HU_10_IA.shp')
+watershed.hu_12 <- read.iowa_sf('~/../Documents/ArcGIS/Projects/cyanotoxins/WBD_HU_08_10_12/WBD_HU_12_IA.shp')
+iowa.sf <-read.iowa_sf('~/../Documents/ArcGIS/Projects/cyanotoxins/iowa_border')
+```
+
+```{r}
+test <- inner_join(watershed.hu_8, freqs) 
+```
+
+
+```{r}
+ws_iowa_intersect <- st_intersection(iowa.sf, test) %>% 
+  clean_names()
+```
+
+```{r}
+tm_shape(ws_iowa_intersect) + 
+  tm_polygons(col = 'white')
+```
+
+```{r}
+ws_iowa_intersect %>% 
+  mutate(developed_sums = developed_open_space + developed_low_intensity + developed_medium_intensity + developed_high_intensity) %>% 
+  ggplot() + 
+  geom_sf(aes(fill = cultivated_crops)) + 
+  ggthemes::theme_map() +
+  scale_fill_gradient2(low = 'white', high = 'lightslateblue') +
+  geom_sf(data = joined_stations, shape = 25, fill = 'black') +
+  labs(
+    title = "DNR Cyanotoxin study sample site locations",
+    subtitle = "Filled by percent of land used for cultivated crops",
+    fill = "Cultivated Crops",
+    caption = "Sources: Watershed borders - geodata.iowa.gov; Land Use information- mrlc.gov"
+  ) + 
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    panel.background = element_rect(fill = 'gray98'),
+    legend.background = element_rect(colour = "black", fill = "white"),
+  )
+  # geom_sf_text(data = joined_stations, aes(label = site),
+               # nudge_x = -1000, nudge_y = -10000)
+  # geom_text_repel(data = t, aes(x = longitude, y = latitude, label = site))
+```
+
+```{r}
+ws_iowa_intersect %>% 
+  mutate(developed_sums = developed_open_space + developed_low_intensity + developed_medium_intensity + developed_high_intensity) %>% 
+  ggplot() + 
+  geom_sf(aes(fill = developed_sums)) +
+  # geom_sf(fill = "white") + 
+  ggthemes::theme_map() +
+  scale_fill_gradient2(low = 'white', high = 'goldenrod4') +
+  geom_sf(data = joined_stations, shape = 25, fill = 'black') +
+  geom_sf(data = st_buffer(site_lat_long, 10000), color = "yellow", alpha = 0.5) +
+  labs(
+    title = "DNR Cyanotoxin study sample site locations",
+    subtitle = "Filled by percent of developed land",
+    fill = "Developed land",
+    caption = "Sources: Watershed borders - geodata.iowa.gov; Land Use information- mrlc.gov"
+  ) + 
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    panel.background = element_rect(fill = 'gray98'),
+    legend.background = element_rect(colour = "black", fill = "white"),
+  )
+```
+```{r}
+iowa.sf %>% 
+  ggplot() + 
+  geom_sf() + 
+  geom_raster()
+```
+
+
+
+```{r}
+
+# ddf <- rasterToPoints(iowa.land_use) %>% 
+#   data.frame()
+# 
+# ggplot(iowa.sf) + 
+#   geom_raster(data = ddf, aes(x, y, fill = NLCD_2016_Land_Cover_1))
+```
+

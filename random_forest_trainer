@@ -12,7 +12,6 @@ from sklearn import preprocessing
 import tensorflow
 from datetime import datetime, timedelta
 
-# sklearn.show_versions()
 
 def separate_into_training_and_testing_sets(training_set, test_set, quarts):
     from sklearn.model_selection import train_test_split
